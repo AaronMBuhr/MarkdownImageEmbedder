@@ -1,0 +1,177 @@
+Metadata-Version: 2.1
+Name: markdown-image-embedder
+Version: 1.0.0
+Summary: Embeds images in markdown files as base64 encoded data URLs
+Home-page: 
+Author: 
+Author-email: 
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Topic :: Text Processing :: Markup :: Markdown
+Classifier: Topic :: Utilities
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: pillow>=8.0.0
+Requires-Dist: requests>=2.25.0
+
+# Markdown Image Embedder (Python Version)
+
+This program reads markdown from stdin, downloads linked images, compresses them as JPEGs with configurable quality, then embeds the images directly in the markdown as base64-encoded data URLs. The modified markdown is output to stdout.
+
+This is a Python port of the original C++ MarkdownImageEmbedder.
+
+## Features
+
+- Finds image links in markdown (`![alt text](URL)`)
+- Downloads images from URLs
+- Compresses images as JPEG with configurable quality
+- Embeds images as base64-encoded data URLs
+- Cross-platform (Windows, Linux, macOS)
+- Configurable JPEG quality
+- Resource tracking for non-embedded files
+
+## Dependencies
+
+- Python 3.8+
+- Pillow (PIL fork): Image processing
+- Requests: HTTP operations
+
+## Installation
+
+### Using pip
+
+```bash
+pip install markdown-image-embedder
+```
+
+### From source
+
+```bash
+git clone <repository-url>
+cd markdown-image-embedder
+pip install .
+```
+
+## Usage
+
+```bash
+python -m markdownimageembedder [options]
+```
+
+or if installed:
+
+```bash
+markdown-image-embedder [options]
+```
+
+### Options
+
+```
+--input-file FILE, -i FILE  Use FILE as input instead of stdin
+--output-file FILE, -o FILE Write output to FILE instead of stdout
+--quality N, -q N           Set quality scale from 1-9 (default: 5)
+                            Lower values = higher quality but larger files
+--yarle, -y                 Enable Yarle compatibility mode
+--max-size N, -m N          Maximum file size to embed in MB (default: 10)
+--path PATH, -p PATH        Base path for resolving relative file paths
+--debug, -d                 Enable debug logging level
+--verbose, -v               Enable verbose logging level
+--help, -h                  Display this help message
+```
+
+### Examples
+
+Process a markdown file with default quality (5):
+
+```bash
+cat input.md | markdown-image-embedder > output.md
+```
+
+Process a markdown file with custom quality (3 - higher quality):
+
+```bash
+cat input.md | markdown-image-embedder --quality 3 > output.md
+```
+
+Specify input and output files:
+
+```bash
+markdown-image-embedder -i input.md -o output.md
+```
+
+Use with Yarle-exported Evernote notes:
+
+```bash
+markdown-image-embedder -i note.md -o embedded.md --yarle
+```
+
+## Implementation Details
+
+- Uses Pillow (PIL) for image processing and compression
+- Uses Requests for HTTP downloads
+- Base64 encoding for image data
+- Detects and skips video files and other unsupported formats
+- Maintains original alt text and dimensions in image tags
+- Preserves clickable images (when the original was a link)
+- Dynamic JPEG quality selection based on image size
+
+## Project Structure
+
+The project follows a modular design with separate classes for specific functionality:
+
+- `base64_encoder.py`: Provides base64 encoding capabilities
+- `cli_parser.py`: Parses command-line arguments
+- `http_client.py`: Handles HTTP operations for downloading images
+- `image_processor.py`: Handles image compression using Pillow
+- `logger_setup.py`: Sets up and configures loggers
+- `markdown_processor.py`: Processes markdown and manages image embedding
+- `utils.py`: Utility functions for file operations and formatting
+- `__main__.py`: Main entry point for the application
+
+## Quality Scale System
+
+The program uses a quality scale system that dynamically adjusts JPEG compression based on the image size:
+
+- Scale 1: Highest quality (lowest compression)
+- Scale 5: Balanced quality/size (default)
+- Scale 9: Lowest quality (highest compression)
+
+The actual JPEG quality value (0-100) is determined by both the quality scale and the original image size, using a lookup table that provides appropriate values for different size ranges.
+
+## Limitations
+
+- Only embeds images up to the configured maximum size (default: 10MB)
+- Video files and some other formats are not embedded
+- Remote images require an active internet connection
+- Very large images might require more memory during processing
+
+## Troubleshooting
+
+### Common Issues
+
+1. **"Image compression failed"**
+   - Ensure Pillow is properly installed
+   - Verify the image format is supported
+
+2. **"Failed to download image"**
+   - Check your internet connection
+   - Verify the URL is valid and accessible
+   - Some websites may block programmatic access
+
+3. **"Failed to resolve local file"**
+   - Check file paths
+   - Try using the `--path` option to provide a base path
+
+## License
+
+MIT License
+
+## Acknowledgments
+
+This is a Python port of the original C++ MarkdownImageEmbedder.

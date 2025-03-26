@@ -1,0 +1,2 @@
+[console_scripts]
+markdown-image-embedder = __main__:main
