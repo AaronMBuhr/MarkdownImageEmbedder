@@ -41,9 +41,11 @@ class CommandLineOptions:
     """Holds the parsed command line options."""
     debug: bool = False
     verbose: bool = False
+    quiet: bool = False
     yarle_mode: bool = False
     input_file: Optional[str] = None
     output_file: Optional[str] = None
+    log_file: Optional[str] = None
     base_path: str = ""
     quality_scale: int = 5  # Default 5 (1-9 scale, lower = higher quality)
     max_file_size_mb: int = 10  # Maximum size for embedded files in MB
@@ -58,6 +60,50 @@ class ImageMatch:
     url: str            # URL or file path to the image
     position: int       # Position in the original markdown
     length: int         # Length of the match
+
+class LogFilter(logging.Filter):
+    """Filter to control which log records are emitted."""
+    def __init__(self, quiet=False):
+        super().__init__()
+        self.quiet = quiet
+        
+    def filter(self, record):
+        # In quiet mode, only let through ERROR or higher level messages
+        if self.quiet and record.levelno < logging.ERROR:
+            return False
+        return True
+
+def configure_logging(options: CommandLineOptions):
+    """Configure logging based on command line options."""
+    # Set logging level based on options
+    if options.debug:
+        logger.setLevel(logging.DEBUG)
+    elif options.verbose:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.WARNING)
+    
+    # Apply quiet filter if requested
+    if options.quiet:
+        for handler in logger.handlers:
+            handler.addFilter(LogFilter(quiet=True))
+    
+    # Add file handler if log file specified
+    if options.log_file:
+        try:
+            file_handler = logging.FileHandler(options.log_file, 'w', encoding='utf-8')
+            file_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+            # When using a log file, always log at INFO level or higher to the file
+            file_handler.setLevel(logging.INFO if not options.debug else logging.DEBUG)
+            logger.addHandler(file_handler)
+            
+            # In quiet mode with a log file, redirect everything to the log file
+            if options.quiet:
+                # Remove all filters from the file handler to ensure it gets all messages
+                for f in file_handler.filters:
+                    file_handler.removeFilter(f)
+        except Exception as e:
+            logger.error(f"Failed to create log file: {e}")
 
 def parse_arguments() -> CommandLineOptions:
     """Parse command line arguments."""
@@ -74,12 +120,20 @@ def parse_arguments() -> CommandLineOptions:
         help="Write output to FILE instead of stdout"
     )
     parser.add_argument(
+        "--log-file", "-l", type=str,
+        help="Write log output to FILE instead of stderr"
+    )
+    parser.add_argument(
         "--quality", "-q", type=int, default=5, choices=range(1, 10),
         help="Set quality scale from 1-9 (default: 5). Lower values = higher quality but larger files"
     )
     parser.add_argument(
         "--yarle", "-y", action="store_true",
         help="Enable Yarle compatibility mode"
+    )
+    parser.add_argument(
+        "--quiet", "-Q", action="store_true",
+        help="Quiet mode: only output errors, no status messages"
     )
     parser.add_argument(
         "--max-size", "-m", type=int, default=10,
@@ -117,9 +171,11 @@ def parse_arguments() -> CommandLineOptions:
     options = CommandLineOptions(
         debug=args.debug,
         verbose=args.verbose,
+        quiet=args.quiet,
         yarle_mode=args.yarle,
         input_file=args.input_file,
         output_file=args.output_file,
+        log_file=args.log_file,
         base_path=base_path,
         quality_scale=args.quality,
         max_file_size_mb=args.max_size,
@@ -326,27 +382,64 @@ def find_image_links(markdown: str) -> List[ImageMatch]:
       - Standard markdown images: ![alt text](url)
       - Obsidian-style images: ![[url]] (with optional dimension info via a pipe)
     """
-    IMAGE_PATTERN = re.compile(
-        r'(?P<obsidian>!\[\[(?P<obsidian_url>.*?)\]\])|'
-        r'(?P<standard>!\[(?P<alt>[^\]]*?)(?:\|(?:[^\]]*?))?\]\((?!data:image)(?P<url>[^\)]*?)\))'
-    )
-    
+    # First try to find Obsidian-style images
     matches = []
+    obsidian_pattern = re.compile(r'!\[\[(?P<url>.*?)\]\]')
     
-    for match in IMAGE_PATTERN.finditer(markdown):
+    for match in obsidian_pattern.finditer(markdown):
         position = match.start()
-        if match.group("obsidian"):
-            match_text = match.group("obsidian")
-            url = match.group("obsidian_url")
-            alt_text = ""
-        elif match.group("standard"):
-            match_text = match.group("standard")
-            alt_text = match.group("alt") or ""
-            url = match.group("url")
-        else:
-            continue
-        
+        match_text = match.group(0)
+        url = match.group("url")
+        alt_text = ""
         matches.append(ImageMatch(match_text, alt_text, url, position, len(match_text)))
+    
+    # Then find standard markdown images, being careful with URLs containing parentheses
+    pos = 0
+    while pos < len(markdown):
+        # Find the start of a markdown image
+        start_pos = markdown.find("![", pos)
+        if start_pos == -1:
+            break
+            
+        # Find the end of the alt text
+        alt_end = markdown.find("](", start_pos)
+        if alt_end == -1:
+            pos = start_pos + 2
+            continue
+            
+        # Extract alt text
+        alt_text = markdown[start_pos + 2:alt_end]
+        
+        # Find the end of the URL by finding the matching closing parenthesis
+        # We need to handle nested parentheses in the URL
+        url_start = alt_end + 2
+        url_end = -1
+        paren_count = 1
+        
+        for i in range(url_start, len(markdown)):
+            if markdown[i] == '(':
+                paren_count += 1
+            elif markdown[i] == ')':
+                paren_count -= 1
+                if paren_count == 0:
+                    url_end = i
+                    break
+                    
+        if url_end == -1:
+            pos = start_pos + 2
+            continue
+            
+        url = markdown[url_start:url_end]
+        
+        # Skip already embedded images
+        if url.startswith("data:image"):
+            pos = url_end + 1
+            continue
+            
+        match_text = markdown[start_pos:url_end + 1]
+        matches.append(ImageMatch(match_text, alt_text, url, start_pos, len(match_text)))
+        
+        pos = url_end + 1
         
     return matches
 
@@ -355,6 +448,15 @@ def resolve_file_path(path: str, base_path: str) -> str:
     Attempt to resolve a local file path.
     """
     clean_path = path.rstrip('/\\"\' \t\r\n')
+    
+    # URL decode the path to handle %20 and other encoded characters
+    try:
+        import urllib.parse
+        decoded_path = urllib.parse.unquote(clean_path)
+        logger.debug(f"URL decoded path: {clean_path} -> {decoded_path}")
+        clean_path = decoded_path
+    except Exception as e:
+        logger.debug(f"Error decoding URL: {e}")
     
     if os.path.isfile(clean_path):
         return clean_path
@@ -417,11 +519,22 @@ def process_image_match(match: ImageMatch, options: CommandLineOptions, stats: d
     if not url.startswith(("http://", "https://")):
         is_local_file = True
         if not os.path.isfile(url):
+            logger.debug(f"File not found at exact path: {url}")
             resolved_path = resolve_file_path(url, options.base_path)
             if resolved_path:
                 url = resolved_path
+                logger.debug(f"Resolved to: {url}")
             else:
                 logger.debug(f"Failed to resolve local file: {url}")
+                # Try to create directory listing to help diagnose the issue
+                try:
+                    dir_path = os.path.dirname(url) or '.'
+                    if os.path.exists(dir_path):
+                        files = os.listdir(dir_path)
+                        logger.debug(f"Files in directory {dir_path}: {files[:10]}{' and more...' if len(files) > 10 else ''}")
+                except Exception as dir_err:
+                    logger.debug(f"Error listing directory: {dir_err}")
+                
                 stats["non_embedded_resources"].add(url)
                 return match.original_text
         try:
@@ -555,12 +668,8 @@ def main() -> int:
     """Main entry point for the application."""
     options = parse_arguments()
     
-    if options.debug:
-        logger.setLevel(logging.DEBUG)
-    elif options.verbose:
-        logger.setLevel(logging.INFO)
-    else:
-        logger.setLevel(logging.WARNING)
+    # Configure logging based on options
+    configure_logging(options)
     
     try:
         logger.info("Reading input...")
@@ -598,10 +707,10 @@ def main() -> int:
             logger.error(f"Error writing output: {e}")
             return 1
             
-        if stats["images_processed"] > 0:
+        if stats["images_processed"] > 0 and not options.quiet:
             logger.info(f"{stats['images_processed']} images processed")
             
-        if stats["non_embedded_resources"]:
+        if stats["non_embedded_resources"] and not options.quiet:
             logger.info("\nThe following resources were not embedded and need to be preserved:")
             for resource in stats["non_embedded_resources"]:
                 logger.info(f"  {resource}")
@@ -616,3 +725,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+    
