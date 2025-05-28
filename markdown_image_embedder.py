@@ -13,6 +13,9 @@ import mimetypes
 import os
 import re
 import sys
+import glob  # Added for wildcard expansion
+import shutil # Added for backup functionality
+import warnings  # Added for warning capture
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 
@@ -23,6 +26,23 @@ from PIL import Image
 logging.basicConfig(format='%(levelname)s: %(message)s', stream=sys.stderr)
 logger = logging.getLogger('markdown-image-embedder')
 logger.setLevel(logging.INFO)
+
+# Create a custom warning handler that redirects warnings to our logger
+def warning_to_logger(message, category, filename, lineno, file=None, line=None):
+    """Send warnings to our logger with prefix format."""
+    warning_message = f"{filename}:{lineno}: {category.__name__}: {message}"
+    # If we're in the middle of processing a file, we'll add the prefix
+    current_file = getattr(warning_to_logger, 'current_file', None)
+    if current_file:
+        print(f"markdown_image_embedder error processing file: {os.path.basename(current_file)}", file=sys.stderr)
+    print(warning_message, file=sys.stderr)
+    logger.warning(warning_message)
+
+# Store the current file being processed in the warning handler
+warning_to_logger.current_file = None
+
+# Redirect warnings to our custom handler
+warnings.showwarning = warning_to_logger
 
 # Try to import SVG support libraries.
 try:
@@ -42,8 +62,11 @@ class CommandLineOptions:
     debug: bool = False
     verbose: bool = False
     quiet: bool = False
+    summary: bool = False
+    backup: bool = False
+    overwrite: bool = False
     yarle_mode: bool = False
-    input_file: Optional[str] = None
+    input_files: List[str] = None
     output_file: Optional[str] = None
     log_file: Optional[str] = None
     base_path: str = ""
@@ -51,6 +74,7 @@ class CommandLineOptions:
     max_file_size_mb: int = 10  # Maximum size for embedded files in MB
     max_width: Optional[int] = None  # Maximum width for images in pixels
     max_height: Optional[int] = None  # Maximum height for images in pixels
+    current_file: Optional[str] = None  # Current file being processed (for error context)
 
 @dataclass
 class ImageMatch:
@@ -75,54 +99,131 @@ class LogFilter(logging.Filter):
 
 def configure_logging(options: CommandLineOptions):
     """Configure logging based on command line options."""
-    # Set logging level based on options
-    if options.debug:
-        logger.setLevel(logging.DEBUG)
-    elif options.verbose:
-        logger.setLevel(logging.INFO)
-    else:
-        logger.setLevel(logging.WARNING)
+    # Always set base logger level to DEBUG to allow all messages to reach all handlers
+    # Individual handlers will filter based on their own levels
+    logger.setLevel(logging.DEBUG)
     
-    # Apply quiet filter if requested
-    if options.quiet:
-        for handler in logger.handlers:
-            handler.addFilter(LogFilter(quiet=True))
+    # Clear existing handlers to avoid duplication
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()  # Ensure files are closed
     
-    # Add file handler if log file specified
+    # Add file handler if log file specified - always gets verbose (INFO) or debug output
     if options.log_file:
         try:
             file_handler = logging.FileHandler(options.log_file, 'w', encoding='utf-8')
-            file_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
-            # When using a log file, always log at INFO level or higher to the file
-            file_handler.setLevel(logging.INFO if not options.debug else logging.DEBUG)
+            file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)-8s: %(message)s'))
+            # Log file always gets minimum INFO level (verbose output), or DEBUG if requested
+            if options.debug:
+                file_handler.setLevel(logging.DEBUG)
+            else:
+                file_handler.setLevel(logging.INFO)  # Verbose output for log files by default
             logger.addHandler(file_handler)
-            
-            # In quiet mode with a log file, redirect everything to the log file
-            if options.quiet:
-                # Remove all filters from the file handler to ensure it gets all messages
-                for f in file_handler.filters:
-                    file_handler.removeFilter(f)
+            # Use file_handler directly to log startup message to avoid console output
+            startup_msg = f"File logging started at level {logging.getLevelName(file_handler.level)}"
+            file_record = logging.LogRecord(
+                name=logger.name, level=logging.INFO, 
+                pathname="", lineno=0, 
+                msg=startup_msg, args=(), exc_info=None
+            )
+            file_handler.emit(file_record)
         except Exception as e:
-            logger.error(f"Failed to create log file: {e}")
+            # Use print because logging might be unreliable
+            print(f"FATAL: Failed to create log file '{options.log_file}': {e}", file=sys.stderr)
+            # Continue with console only
+            pass
+            
+    # Configure Console Handler (stderr) - will have different level than file handler
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))  # Simpler format for console
+    
+    # Determine writing_to_stdout based on options
+    is_piped_stdin = not sys.stdin.isatty()
+    writing_to_stdout = False  # Default to False
+    if not options.input_files and is_piped_stdin and not options.output_file:
+        # Input from stdin, output to stdout
+        writing_to_stdout = True
+    elif options.input_files and len(options.input_files) == 1 and not glob.has_magic(options.input_files[0]):
+        # Single specific input file provided
+        # Check if it truly resolves to one file and no output/backup/overwrite is set
+        try:
+            if len(glob.glob(options.input_files[0], recursive=True)) == 1:
+                if not options.output_file and not options.backup and not options.overwrite:
+                    writing_to_stdout = True
+        except Exception:
+            pass  # Ignore glob errors for this check
+            
+    # Configure console output level based on user options
+    if writing_to_stdout:
+        # If writing markdown to stdout, silence console messages completely
+        console_handler.setLevel(logging.CRITICAL + 1)  # Set level higher than critical
+    elif options.quiet:
+        console_handler.setLevel(logging.ERROR)  # Only show ERROR and CRITICAL
+    elif options.verbose:
+        console_handler.setLevel(logging.INFO)  # Show INFO (verbose per-image output)
+    elif options.debug:
+        console_handler.setLevel(logging.DEBUG)  # Show DEBUG messages
+    else:
+        # Default Concise Summary Mode - suppress detailed processing messages
+        # The actual summary will be printed separately at the end
+        console_handler.setLevel(logging.ERROR)  # Only show errors during processing
+
+    logger.addHandler(console_handler)
+    
+    # Ensure logger propagation is disabled to prevent duplicates
+    logger.propagate = False
 
 def parse_arguments() -> CommandLineOptions:
-    """Parse command line arguments."""
+    """Parse command line arguments, separating known options from input files."""
     parser = argparse.ArgumentParser(
-        description="Embed images in markdown files as base64 encoded data URLs."
+        description="Embed images in markdown files as base64 encoded data URLs.",
+        # Prevent argparse from exiting on its own for unrecognized args
+        # add_help=False # We might add our own help processing later if needed
     )
 
-    parser.add_argument(
-        "--input-file", "-i", type=str,
-        help="Use FILE as input instead of stdin"
-    )
+    # --- Define Known Options --- 
+    # Input/Output Options (Remove --input-files)
+    # parser.add_argument(
+    #     "--input-files", "-i", type=str, nargs='+',
+    #     help="One or more input markdown files or patterns (wildcards allowed). If omitted, reads from stdin."
+    # )
     parser.add_argument(
         "--output-file", "-o", type=str,
-        help="Write output to FILE instead of stdout"
+        help="Write output to FILE instead of stdout. Incompatible with multiple inputs or --backup/--overwrite."
     )
+    backup_overwrite_group = parser.add_mutually_exclusive_group()
+    backup_overwrite_group.add_argument(
+        "--backup", "-b", action="store_true",
+        help="Create a backup (.bak) of the original file before overwriting. Incompatible with -o."
+    )
+    backup_overwrite_group.add_argument(
+        "--overwrite", action="store_true", # No short option for safety
+        help="Overwrite the original input file(s). Required if using multiple inputs without --backup. Incompatible with -o."
+    )
+
+    # Logging & Reporting
     parser.add_argument(
         "--log-file", "-l", type=str,
         help="Write log output to FILE instead of stderr"
     )
+    # Console Output Control Group (Mutually Exclusive)
+    verbosity_group = parser.add_mutually_exclusive_group()
+    verbosity_group.add_argument(
+        "--quiet", "-Q", action="store_true",
+        help="Quiet console output: only show critical errors on stderr."
+    )
+    verbosity_group.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Verbose console output: show detailed per-image processing info on stderr."
+    )
+    verbosity_group.add_argument(
+        "--debug", "-d", action="store_true",
+        help="Debug console output: show detailed debug messages on stderr."
+    )
+    # Note: A concise summary is the default console output if none of the above are specified
+    # and if output is not going to stdout.
+
+    # Processing Options
     parser.add_argument(
         "--quality", "-q", type=int, default=5, choices=range(1, 10),
         help="Set quality scale from 1-9 (default: 5). Lower values = higher quality but larger files"
@@ -130,10 +231,6 @@ def parse_arguments() -> CommandLineOptions:
     parser.add_argument(
         "--yarle", "-y", action="store_true",
         help="Enable Yarle compatibility mode"
-    )
-    parser.add_argument(
-        "--quiet", "-Q", action="store_true",
-        help="Quiet mode: only output errors, no status messages"
     )
     parser.add_argument(
         "--max-size", "-m", type=int, default=10,
@@ -149,40 +246,142 @@ def parse_arguments() -> CommandLineOptions:
     )
     parser.add_argument(
         "--path", "-p", type=str, default="",
-        help="Base path for resolving relative file paths"
-    )
-    parser.add_argument(
-        "--debug", "-d", action="store_true",
-        help="Enable debug logging level"
-    )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true",
-        help="Enable verbose logging level"
+        help="Base path for resolving relative file paths (defaults to CWD if multiple/wildcard inputs, else input file's directory)"
     )
 
-    args = parser.parse_args()
+    # --- Parse Known Args & Separate Input Files --- 
+    args, unknown_args = parser.parse_known_args()
+
+    input_files = []
+    potential_errors = []
+    for arg in unknown_args:
+        # Treat non-option arguments as input files/patterns
+        if not arg.startswith('-'):
+            input_files.append(arg)
+        # Allow --log-file added by batch script
+        elif arg == '--log-file':
+            # Find its value (the next argument)
+            try:
+                log_file_index = unknown_args.index('--log-file')
+                if log_file_index + 1 < len(unknown_args):
+                     args.log_file = unknown_args[log_file_index + 1]
+                     # Remove --log-file and its value so they aren't treated as errors
+                     # Process removal carefully to avoid index issues
+                     del unknown_args[log_file_index:log_file_index+2]
+                else:
+                     potential_errors.append(f"argument --log-file: expected one argument")
+            except ValueError:
+                 pass # Should not happen if found, but handle gracefully
+            except Exception as e: # Catch other potential issues
+                 potential_errors.append(f"Error processing --log-file argument: {e}")
+        else:
+            # Any other unknown arg starting with '-' is an error
+            potential_errors.append(arg)
+
+    if potential_errors:
+         parser.error(f"unrecognized arguments: {' '.join(potential_errors)}")
+
+    # --- Validation based on separated inputs --- 
+    # Check if stdin is being used (no explicit files and stdin is not a tty)
+    is_piped_stdin = not sys.stdin.isatty()
+    is_stdin_input = not input_files and is_piped_stdin
     
-    # If path is not specified but input file is, use the input file's directory as base path.
+    if not input_files and not is_stdin_input:
+        parser.error("No input files specified and no data piped via stdin.")
+    elif not input_files and is_stdin_input and (args.backup or args.overwrite):
+        # Cannot use backup/overwrite with stdin
+        parser.error("--backup or --overwrite cannot be used with stdin input.")
+        
+    is_multi_input = len(input_files) > 1
+    # Use glob logic here for more robust wildcard detection
+    has_wildcards = False
+    actual_input_files_for_check = []
+    if input_files:
+        try:
+            # Expand potential wildcards ONLY for the validation check
+            # The actual expansion happens later in main()
+            temp_expanded = []
+            for pattern in input_files:
+                 # Use glob.has_magic to check for actual wildcard characters
+                 if glob.has_magic(pattern):
+                     has_wildcards = True
+                     # Attempt expansion to see if it matches multiple files
+                     matches = glob.glob(pattern, recursive=True)
+                     if len(matches) > 1:
+                         is_multi_input = True # Treat wildcard matching multiple as multi-input
+                     temp_expanded.extend(matches)
+                 else:
+                     temp_expanded.append(pattern)
+            actual_input_files_for_check = temp_expanded
+            if len(actual_input_files_for_check) > 1:
+                 is_multi_input = True
+        except Exception as e:
+            logger.warning(f"Could not reliably check for wildcards due to error: {e}")
+            # Be conservative: assume wildcards if any pattern contains wildcard chars
+            has_wildcards = any(glob.has_magic(p) for p in input_files)
+            if len(input_files) > 1:
+                 is_multi_input = True
+                 
+    # Now perform validation using potentially updated is_multi_input/has_wildcards
+    if (is_multi_input or has_wildcards):
+        if args.output_file:
+            parser.error("--output-file (-o) cannot be used with multiple input files or wildcards.")
+        if not args.backup and not args.overwrite:
+            # Allow processing multiple files only if backup or overwrite is specified
+            parser.error("Multiple input files or wildcards require either --backup (-b) or --overwrite.")
+    elif input_files: # Single input file specified (len == 1 and no wildcards detected)
+         if args.backup and args.output_file:
+             parser.error("--backup (-b) cannot be used with --output-file (-o).")
+         if args.overwrite and args.output_file:
+             parser.error("--overwrite cannot be used with --output-file (-o).")
+    # No specific validation needed for stdin + output_file case here
+
+    # --- Base Path Logic --- 
     base_path = args.path
-    if not base_path and args.input_file:
-        base_path = os.path.dirname(os.path.abspath(args.input_file))
-        logger.debug(f"Using input file directory as base path: {base_path}")
-    
+    if not base_path:
+        if input_files and len(input_files) == 1 and not has_wildcards:
+            # Single, specific input file
+            try:
+                 # Use abspath to handle relative input paths correctly
+                abs_input_path = os.path.abspath(input_files[0])
+                if os.path.isfile(abs_input_path): # Check if it's a file before getting dirname
+                    base_path = os.path.dirname(abs_input_path)
+                    logger.debug(f"Using input file directory as base path: {base_path}")
+                else:
+                    # If the single input file doesn't exist yet, default to CWD
+                    base_path = os.getcwd()
+                    logger.debug(f"Single input file not found, using CWD as base path: {base_path}")
+            except Exception as e:
+                 logger.warning(f"Could not determine directory for input file {input_files[0]}, using CWD as base path. Error: {e}")
+                 base_path = os.getcwd()
+        else:
+            # Stdin, multiple inputs, or wildcards: default base_path is current working directory
+            base_path = os.getcwd()
+            logger.debug(f"Using current working directory as base path: {base_path}")
+    else:
+         # If -p is provided, always use it and make it absolute
+         base_path = os.path.abspath(base_path)
+         logger.debug(f"Using specified base path: {base_path}")
+
+    # --- Populate Options Dataclass --- 
     options = CommandLineOptions(
         debug=args.debug,
-        verbose=args.verbose,
         quiet=args.quiet,
+        verbose=args.verbose,
+        backup=args.backup,
+        overwrite=args.overwrite,
         yarle_mode=args.yarle,
-        input_file=args.input_file,
+        input_files=input_files, # Use the separated list
         output_file=args.output_file,
-        log_file=args.log_file,
+        log_file=args.log_file, # Already populated from unknown_args or None
         base_path=base_path,
         quality_scale=args.quality,
         max_file_size_mb=args.max_size,
         max_width=args.max_width,
-        max_height=args.max_height
+        max_height=args.max_height,
+        current_file=None  # Initialize to None, will be set during processing
     )
-    
+
     return options
 
 def format_file_size(size_bytes: int) -> str:
@@ -491,6 +690,22 @@ def split_on_unescaped_pipe(text: str) -> Tuple[str, Optional[str]]:
     else:
         return text, None
 
+def log_error_with_prefix(message, filename=None):
+    """
+    Log error with standard prefix to both console and log file.
+    Console error has specific prefix format.
+    """
+    # Full message goes to log file via normal logging
+    logger.error(message)
+    
+    # Console gets prefixed message to stderr
+    if filename:
+        prefix = f"markdown_image_embedder error processing file: {filename}"
+        print(f"{prefix}", file=sys.stderr)
+    
+    # Print the actual error message
+    print(message, file=sys.stderr)
+
 def process_image_match(match: ImageMatch, options: CommandLineOptions, stats: dict) -> str:
     """
     Process a single image match and return the embedded markdown.
@@ -498,6 +713,7 @@ def process_image_match(match: ImageMatch, options: CommandLineOptions, stats: d
     url = match.url
     is_local_file = False
     image_data = None
+    current_file = getattr(options, 'current_file', None)  # Get current file context if available
 
     logger.debug(f"Processing image: {url}")
 
@@ -505,7 +721,7 @@ def process_image_match(match: ImageMatch, options: CommandLineOptions, stats: d
     url = url.strip()
 
     if is_embedded_image(url):
-        logger.info("Preserving already embedded image.")
+        logger.debug("Preserving already embedded image.")
         return match.original_text
 
     if options.yarle_mode and not url.startswith(("http://", "https://")):
@@ -541,7 +757,11 @@ def process_image_match(match: ImageMatch, options: CommandLineOptions, stats: d
             with open(url, "rb") as f:
                 image_data = f.read()
         except Exception as e:
-            logger.error(f"Error reading local file: {url} - {e}")
+            err_msg = f"Error reading local file: {url} - {e}"
+            if current_file:
+                log_error_with_prefix(err_msg, os.path.basename(current_file))
+            else:
+                logger.error(err_msg)
             stats["non_embedded_resources"].add(url)
             return match.original_text
     else:
@@ -571,6 +791,7 @@ def process_image_match(match: ImageMatch, options: CommandLineOptions, stats: d
     stats["total_image_size"] += original_size
     stats["total_compressed_size"] += compressed_size
 
+    # Log detailed size info at INFO level (will go to file always, console if -v or -d)
     logger.info(
         f"Embedding [{url}](JPEG quality {jpeg_quality}%): {format_file_size(original_size)} -> {format_file_size(compressed_size)}"
     )
@@ -612,11 +833,25 @@ def process_image_match(match: ImageMatch, options: CommandLineOptions, stats: d
     else:
         return embedded_image
 
-def process_markdown(markdown: str, options: CommandLineOptions) -> Tuple[str, dict]:
+def process_markdown(markdown: str, options: CommandLineOptions, current_file_path: Optional[str] = None) -> Tuple[str, dict]:
     """
     Process markdown text and embed images.
+    Args:
+        markdown: The markdown content to process.
+        options: The command line options.
+        current_file_path: The path to the current file being processed (used for logging context).
+    Returns:
+        A tuple containing the processed markdown and a dictionary of statistics.
     """
     original_markdown_size = len(markdown)
+    # Use DEBUG level for context message, as it's not needed in normal verbose output
+    file_context = f" for file: {current_file_path}" if current_file_path else " for stdin"
+    logger.debug(f"Processing markdown{file_context}, original size: {original_markdown_size} bytes")
+
+    # Store current file path in options for error context
+    temp_options = options
+    if current_file_path:
+        temp_options.current_file = current_file_path
 
     stats = {
         "total_image_size": 0,
@@ -628,7 +863,8 @@ def process_markdown(markdown: str, options: CommandLineOptions) -> Tuple[str, d
     }
 
     matches = find_image_links(markdown)
-    logger.info(f"Found {len(matches)} image links in markdown")
+    # This is a key message, log at INFO level for log file and verbose console
+    logger.info(f"Found {len(matches)} image links{file_context}") 
 
     result = []
     last_pos = 0
@@ -636,7 +872,7 @@ def process_markdown(markdown: str, options: CommandLineOptions) -> Tuple[str, d
         if match.position > last_pos:
             result.append(markdown[last_pos:match.position])
         logger.debug(f"Processing image match at position {match.position}")
-        embedded_image = process_image_match(match, options, stats)
+        embedded_image = process_image_match(match, temp_options, stats)
         result.append(embedded_image)
         last_pos = match.position + match.length
 
@@ -653,14 +889,21 @@ def process_markdown(markdown: str, options: CommandLineOptions) -> Tuple[str, d
 
     total_original_size = original_markdown_size + stats["total_image_size"]
     final_size = stats["total_output_size"]
+    change_bytes = final_size - original_markdown_size # Change relative to original markdown only
+    stats["change_bytes"] = change_bytes
     compression_ratio = (final_size / total_original_size * 100) if total_original_size > 0 else 0
 
+    # Log detailed size info at INFO level (will go to file always, console if -v or -d)
     logger.info(
-        f"Sizes: Original (md + {stats['images_processed']} images) = {format_file_size(total_original_size)} "
-        f"({format_file_size(original_markdown_size)} + {format_file_size(stats['total_image_size'])}), "
-        f"Final (md with {stats['images_processed']} images) = {format_file_size(final_size)} "
-        f"({compression_ratio:.0f}%)"
+        f"Sizes{file_context}: Original MD={format_file_size(original_markdown_size)}, "
+        f"Images Found={stats['images_processed']} ({format_file_size(stats['total_image_size'])}), "
+        f"Final MD Size={format_file_size(final_size)} (Change: {format_file_size(change_bytes)}), "
+        f"Overall Ratio={compression_ratio:.0f}%"
     )
+    
+    # Add key stats for summary reporting
+    stats["input_md_size"] = original_markdown_size
+    stats["output_md_size"] = final_size
 
     return output, stats
 
@@ -668,60 +911,268 @@ def main() -> int:
     """Main entry point for the application."""
     options = parse_arguments()
     
-    # Configure logging based on options
+    # Configure logging just once, early in main
     configure_logging(options)
     
-    try:
-        logger.info("Reading input...")
-        input_markdown = ""
+    # --- Initialization ---
+    exit_code = 0
+    processed_files_count = 0
+    overall_non_embedded = set()
+    overall_success_count = 0
+    overall_error_count = 0
+    processed_file_details = []  # List to hold (filename, status, msg, initial_size, final_size)
+
+    # --- Determine Input Files ---
+    files_to_process = []
+    if options.input_files:
+        logger.debug(f"Input patterns/files: {options.input_files}")
+        # Create a human-readable description of input patterns for summary output
+        input_desc = ' '.join(f'"{pattern}"' if ' ' in pattern else pattern 
+                            for pattern in options.input_files)
         
-        if options.input_file:
+        for pattern in options.input_files:
             try:
-                with open(options.input_file, 'r', encoding='utf-8') as f:
-                    input_markdown = f.read()
-                logger.info(f"Read input from file: {options.input_file}")
+                expanded_files = glob.glob(pattern, recursive=True)  # Allow recursive globbing
+                if not expanded_files:
+                     # Use our error handler for no matches
+                     log_error_with_prefix(f"Input pattern '{pattern}' did not match any files.")
+                else:
+                    files_to_process.extend(expanded_files)
             except Exception as e:
-                logger.error(f"Error reading input file: {e}")
-                return 1
-        else:
-            try:
-                input_markdown = sys.stdin.read()
-                logger.info("Read input from stdin")
-            except Exception as e:
-                logger.error(f"Error reading from stdin: {e}")
-                return 1
-            
-        logger.info("Processing markdown...")
-        output_markdown, stats = process_markdown(input_markdown, options)
-        
-        try:
-            if options.output_file:
-                with open(options.output_file, 'w', encoding='utf-8') as f:
-                    f.write(output_markdown)
-                logger.info(f"Wrote output to file: {options.output_file}")
+                log_error_with_prefix(f"Error expanding pattern '{pattern}': {e}")
+                exit_code = 1
+        # Remove duplicates and sort
+        files_to_process = sorted(list(set(f for f in files_to_process if os.path.isfile(f))))
+        if not files_to_process:
+             log_error_with_prefix("No valid input files found after expanding patterns.")
+             return 1  # Hard exit if no files match
+        logger.info(f"Found {len(files_to_process)} files to process.")
+    else:
+        input_desc = "stdin"
+        logger.info("Reading input from stdin...")
+        # Intentionally leave files_to_process empty for stdin case
+
+    # --- Processing Loop ---
+    if files_to_process:
+        # Print header with clear description of what we're processing
+        file_count = len(files_to_process)
+        if file_count == 1:
+            # For single file, use the actual filename with quotes if needed
+            filename = os.path.basename(files_to_process[0])
+            if ' ' in filename or '&' in filename:
+                print(f"markdown_image_embedder processing 1 file: \"{filename}\"", file=sys.stderr)
             else:
+                print(f"markdown_image_embedder processing 1 file: {filename}", file=sys.stderr)
+        else:
+            # For multiple files, use the original input pattern(s)
+            print(f"markdown_image_embedder processing {file_count} files: {input_desc}", file=sys.stderr)
+            
+        for input_file in files_to_process:
+            # Store details for final summary
+            file_detail = {"filename": input_file, "status": "ERROR", "message": "", 
+                           "initial_size": 0, "final_size": 0}
+            # Set current file in the warning handler
+            warning_to_logger.current_file = input_file
+            # Log start of file processing at INFO level (console if -v/-d, always in log file)
+            logger.info(f"--- Processing file: {input_file} ---") 
+            try:
+                # Log reading action at DEBUG level
+                logger.debug(f"Reading file: {input_file}")
+                with open(input_file, 'r', encoding='utf-8') as f:
+                    input_markdown = f.read()
+                file_detail["initial_size"] = len(input_markdown) # Store initial size
+
+                output_markdown, stats = process_markdown(input_markdown, options, current_file_path=input_file)
+                overall_non_embedded.update(stats["non_embedded_resources"])
+
+                # Determine output action
+                if options.backup:
+                    backup_file = input_file + ".bak"
+                    # Log backup action at DEBUG level (less critical than processing)
+                    logger.debug(f"Creating backup: {backup_file}") 
+                    try:
+                        shutil.copy2(input_file, backup_file)
+                        with open(input_file, 'w', encoding='utf-8') as f:
+                            f.write(output_markdown)
+                        # Log overwrite action at DEBUG level
+                        logger.debug(f"Overwrote original file: {input_file}") 
+                        file_detail["status"] = "OK"
+                        processed_files_count += 1
+                    except Exception as e:
+                        err_msg = f"Failed to create backup or overwrite {input_file}: {e}"
+                        log_error_with_prefix(err_msg, os.path.basename(input_file))
+                        file_detail["message"] = f"backup/overwrite failed: {e}"
+                        exit_code = 1
+                elif options.overwrite:
+                    # Log overwrite action at DEBUG level
+                    logger.debug(f"Overwriting original file: {input_file}") 
+                    try:
+                        with open(input_file, 'w', encoding='utf-8') as f:
+                            f.write(output_markdown)
+                        file_detail["status"] = "OK"
+                        processed_files_count += 1
+                    except Exception as e:
+                        err_msg = f"Failed to overwrite {input_file}: {e}"
+                        log_error_with_prefix(err_msg, os.path.basename(input_file))
+                        file_detail["message"] = f"overwrite failed: {e}"
+                        exit_code = 1
+                elif options.output_file:
+                    # This case should only happen for a single, non-wildcard input per validation
+                    # Log write action at DEBUG level
+                    logger.debug(f"Writing output to file: {options.output_file}") 
+                    try:
+                        with open(options.output_file, 'w', encoding='utf-8') as f:
+                            f.write(output_markdown)
+                        file_detail["status"] = "OK"
+                        processed_files_count += 1
+                    except Exception as e:
+                        err_msg = f"Failed to write output file {options.output_file}: {e}"
+                        log_error_with_prefix(err_msg, os.path.basename(input_file))
+                        file_detail["message"] = f"write failed: {e}"
+                        exit_code = 1
+                else:
+                    # Single file, no backup/overwrite, no output file -> stdout
+                    # Use logger.debug here as markdown is going to stdout
+                    logger.debug("Writing output to stdout") 
+                    # --- CRITICAL: Write ONLY markdown to stdout --- 
+                    sys.stdout.write(output_markdown)
+                    sys.stdout.flush()
+                    # --- END CRITICAL SECTION --- 
+                    file_detail["status"] = "OK"
+                    processed_files_count += 1
+
+                # Update final size for summary
+                file_detail["final_size"] = stats.get("output_md_size", 0)
+
+            except Exception as e:
+                err_msg = f"Error processing file {input_file}: {e}"
+                # Use our standardized error handler
+                log_error_with_prefix(err_msg, os.path.basename(input_file))
+                file_detail["message"] = f"Error: {e}"
+                exit_code = 1
+                if options.debug:
+                    logger.exception(f"Stack trace for {input_file}:", exc_info=True)
+
+            finally:
+                # Reset the warning handler's current file
+                warning_to_logger.current_file = None
+
+            # Store results for this file
+            processed_file_details.append(file_detail)
+            if file_detail["status"] == "OK":
+                 overall_success_count += 1
+            else:
+                 overall_error_count += 1
+
+    else: # Process stdin
+        stdin_detail = {"filename": "stdin", "status": "ERROR", "message": "",
+                        "initial_size": 0, "final_size": 0}
+        # Set current file in warning handler for stdin
+        warning_to_logger.current_file = "stdin"
+        try:
+            # Log stdin actions at INFO level (always in log file, console only if -v/-d)
+            logger.info("Reading markdown from stdin...") 
+            input_markdown = sys.stdin.read()
+            stdin_detail["initial_size"] = len(input_markdown)
+            logger.info("Processing markdown from stdin...") 
+            output_markdown, stats = process_markdown(input_markdown, options, current_file_path="stdin")
+            overall_non_embedded.update(stats["non_embedded_resources"])
+            stdin_detail["status"] = "OK"
+            processed_files_count += 1
+
+            # Determine output action for stdin
+            if options.output_file:
+                 # Log write action at DEBUG level
+                 logger.debug(f"Writing output to file: {options.output_file}") 
+                 try:
+                     with open(options.output_file, 'w', encoding='utf-8') as f:
+                         f.write(output_markdown)
+                     stdin_detail["status"] = "OK"
+                     processed_files_count += 1
+                 except Exception as e:
+                     err_msg = f"Failed to write output file {options.output_file}: {e}"
+                     log_error_with_prefix(err_msg, "stdin")
+                     stdin_detail["message"] = f"write failed: {e}"
+                     exit_code = 1
+            else:
+                # Default for stdin is stdout
+                # Use logger.debug here as markdown is going to stdout
+                logger.debug("Writing output to stdout") 
+                # --- CRITICAL: Write ONLY markdown to stdout --- 
                 sys.stdout.write(output_markdown)
                 sys.stdout.flush()
-                logger.info("Wrote output to stdout")
+                # --- END CRITICAL SECTION --- 
+                stdin_detail["status"] = "OK"
+                processed_files_count += 1
+
+            # Update final size for summary
+            stdin_detail["final_size"] = stats.get("output_md_size", 0)
+
         except Exception as e:
-            logger.error(f"Error writing output: {e}")
-            return 1
+            err_msg = f"Error processing stdin: {e}"
+            # Use standardized error handler for stdin
+            log_error_with_prefix(err_msg, "stdin")
+            stdin_detail["message"] = f"Error: {e}"
+            exit_code = 1
+            if options.debug:
+                logger.exception("Stack trace for stdin:", exc_info=True)
+
+        finally:
+            # Reset the warning handler's current file
+            warning_to_logger.current_file = None
+
+        # Store results for stdin
+        processed_file_details.append(stdin_detail)
+        if stdin_detail["status"] == "OK":
+            overall_success_count += 1
+        else:
+            overall_error_count += 1
+
+    # --- Final Reporting ---
+    # Print concise summary to stderr if NOT writing to stdout and we're in normal mode
+    # (not quiet, not verbose, not debug)
+    is_piped_stdin = not sys.stdin.isatty()
+    writing_to_stdout = False
+    if not options.input_files and is_piped_stdin and not options.output_file:
+        writing_to_stdout = True
+    elif options.input_files and len(options.input_files) == 1 and not glob.has_magic(options.input_files[0]):
+        try:
+            if len(glob.glob(options.input_files[0], recursive=True)) == 1:
+                if not options.output_file and not options.backup and not options.overwrite:
+                    writing_to_stdout = True
+        except Exception:
+            pass
+    
+    if not options.quiet and not options.verbose and not options.debug and not writing_to_stdout: 
+        total_processed = len(processed_file_details)
+        # Construct input description
+        input_desc = "stdin" if not files_to_process else ' '.join(options.input_files)
+        if total_processed > 0:
+            # Format the summary to match the expected output
+            print(f"markdown_image_embedder processing {total_processed} files: {input_desc}", file=sys.stderr)
             
-        if stats["images_processed"] > 0 and not options.quiet:
-            logger.info(f"{stats['images_processed']} images processed")
+            # Print each file's result in the desired format
+            for item in processed_file_details:
+                 if item["status"] == "OK":
+                     print(f"{os.path.basename(item['filename'])}: {format_file_size(item['initial_size'])} -> {format_file_size(item['final_size'])}", file=sys.stderr)
+                 else:
+                     print(f"{os.path.basename(item['filename'])}: {item['message']}", file=sys.stderr)
             
-        if stats["non_embedded_resources"] and not options.quiet:
-            logger.info("\nThe following resources were not embedded and need to be preserved:")
-            for resource in stats["non_embedded_resources"]:
-                logger.info(f"  {resource}")
-                
-        return 0
-        
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        if options.debug:
-            logger.exception("Stack trace:")
-        return 1
+            # Print the done line with success/failure summary
+            print(f"Done. {total_processed} files: {overall_success_count} success, {overall_error_count} failure(s)", file=sys.stderr)
+        elif files_to_process: # Input files specified, but none were processed
+             print(f"markdown_image_embedder attempted processing {len(files_to_process)} files: {input_desc}", file=sys.stderr)
+             print(f"No files successfully processed. Check logs for failures.", file=sys.stderr)
+             
+    # Report non-embedded resources to log file always (not to console in normal/quiet mode)
+    if overall_non_embedded: 
+        # Use logger.info so it goes to log file and only appears in console if verbose/debug
+        logger.info("\nThe following resources were referenced but not embedded (check paths/URLs):") 
+        # Sort for consistent output
+        for resource in sorted(list(overall_non_embedded)):
+            logger.info(f"  {resource}")
+
+    return exit_code
 
 if __name__ == "__main__":
     sys.exit(main())
