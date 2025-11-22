@@ -84,6 +84,8 @@ class ImageMatch:
     url: str            # URL or file path to the image
     position: int       # Position in the original markdown
     length: int         # Length of the match
+    ref_id: Optional[str] = None  # Reference label if this is a reference-style image
+    style: str = "inline"         # 'inline', 'reference', or 'obsidian'
 
 class LogFilter(logging.Filter):
     """Filter to control which log records are emitted."""
@@ -324,11 +326,9 @@ def parse_arguments() -> CommandLineOptions:
                  
     # Now perform validation using potentially updated is_multi_input/has_wildcards
     if (is_multi_input or has_wildcards):
-        if args.output_file:
-            parser.error("--output-file (-o) cannot be used with multiple input files or wildcards.")
-        if not args.backup and not args.overwrite:
-            # Allow processing multiple files only if backup or overwrite is specified
-            parser.error("Multiple input files or wildcards require either --backup (-b) or --overwrite.")
+        if not args.backup and not args.overwrite and not args.output_file:
+            # Allow processing multiple files only if backup, overwrite, or a single aggregate output file is specified
+            parser.error("Multiple input files or wildcards require either --backup (-b), --overwrite, or --output-file (-o).")
     elif input_files: # Single input file specified (len == 1 and no wildcards detected)
          if args.backup and args.output_file:
              parser.error("--backup (-b) cannot be used with --output-file (-o).")
@@ -579,68 +579,203 @@ def find_image_links(markdown: str) -> List[ImageMatch]:
     
     Supports both:
       - Standard markdown images: ![alt text](url)
-      - Obsidian-style images: ![[url]] (with optional dimension info via a pipe)
+      - Reference-style images:   ![alt text][ref]
+      - Obsidian-style images:    ![[url]] (with optional dimension info via a pipe)
     """
-    # First try to find Obsidian-style images
-    matches = []
+    matches: List[ImageMatch] = []
+
+    # --- Obsidian-style images: ![[path|optional stuff]] ---
     obsidian_pattern = re.compile(r'!\[\[(?P<url>.*?)\]\]')
-    
-    for match in obsidian_pattern.finditer(markdown):
-        position = match.start()
-        match_text = match.group(0)
-        url = match.group("url")
+    for m in obsidian_pattern.finditer(markdown):
+        position = m.start()
+        match_text = m.group(0)
+        url = m.group("url")
         alt_text = ""
-        matches.append(ImageMatch(match_text, alt_text, url, position, len(match_text)))
-    
-    # Then find standard markdown images, being careful with URLs containing parentheses
-    pos = 0
-    while pos < len(markdown):
-        # Find the start of a markdown image
-        start_pos = markdown.find("![", pos)
-        if start_pos == -1:
-            break
-            
-        # Find the end of the alt text
-        alt_end = markdown.find("](", start_pos)
-        if alt_end == -1:
-            pos = start_pos + 2
-            continue
-            
-        # Extract alt text
-        alt_text = markdown[start_pos + 2:alt_end]
-        
-        # Find the end of the URL by finding the matching closing parenthesis
-        # We need to handle nested parentheses in the URL
-        url_start = alt_end + 2
-        url_end = -1
-        paren_count = 1
-        
-        for i in range(url_start, len(markdown)):
-            if markdown[i] == '(':
-                paren_count += 1
-            elif markdown[i] == ')':
-                paren_count -= 1
-                if paren_count == 0:
-                    url_end = i
-                    break
-                    
-        if url_end == -1:
-            pos = start_pos + 2
-            continue
-            
-        url = markdown[url_start:url_end]
-        
-        # Skip already embedded images
+        matches.append(ImageMatch(
+            match_text,
+            alt_text,
+            url,
+            position,
+            len(match_text),
+            ref_id=None,
+            style="obsidian",
+        ))
+
+    # --- Collect reference definitions: [id]: url ---
+    ref_defs: dict[str, str] = {}
+    ref_def_pattern = re.compile(r'^\[(?P<id>[^\]]+)\]:\s+(?P<url>\S+)', re.MULTILINE)
+    for m in ref_def_pattern.finditer(markdown):
+        ref_id = m.group("id")
+        ref_url = m.group("url").strip()
+        if ref_id and ref_url:
+            ref_defs[ref_id] = ref_url
+
+    # --- Standard inline images: ![alt](url) ---
+    # This intentionally does NOT cross line boundaries, which avoids
+    # accidentally treating complex constructs like:
+    #   [![][img-ref] **Text**](https://example.com/article)
+    # as a giant image whose "url" is the article page.
+    inline_pattern = re.compile(r'!\[(?P<alt>[^\]]*)\]\((?P<url>[^)\n]+)\)')
+    for m in inline_pattern.finditer(markdown):
+        url = m.group("url").strip()
         if url.startswith("data:image"):
-            pos = url_end + 1
-            continue
-            
-        match_text = markdown[start_pos:url_end + 1]
-        matches.append(ImageMatch(match_text, alt_text, url, start_pos, len(match_text)))
-        
-        pos = url_end + 1
-        
+            continue  # already embedded
+        alt_text = m.group("alt")
+        position = m.start()
+        match_text = m.group(0)
+        matches.append(ImageMatch(
+            match_text,
+            alt_text,
+            url,
+            position,
+            len(match_text),
+            ref_id=None,
+            style="inline",
+        ))
+
+    # --- Reference-style images: ![alt][ref] ---
+    ref_image_pattern = re.compile(r'!\[(?P<alt>[^\]]*)\]\[(?P<ref>[^\]]+)\]')
+    for m in ref_image_pattern.finditer(markdown):
+        ref_id = m.group("ref")
+        url = ref_defs.get(ref_id)
+        if not url:
+            continue  # unresolved reference, skip
+        url = url.strip()
+        if url.startswith("data:image"):
+            continue  # already embedded
+        alt_text = m.group("alt")
+        position = m.start()
+        match_text = m.group(0)
+        matches.append(ImageMatch(
+            match_text,
+            alt_text,
+            url,
+            position,
+            len(match_text),
+            ref_id=ref_id,
+            style="reference",
+        ))
+
+    # Return matches in document order
+    matches.sort(key=lambda m: m.position)
     return matches
+
+def embed_image_data(match: ImageMatch, options: CommandLineOptions, stats: dict) -> Optional[str]:
+    """
+    Download/resolve, compress and base64‑encode image data for a single match.
+    Returns the full data URL string, or None if embedding should be skipped.
+    """
+    url = match.url
+    is_local_file = False
+    image_data = None
+    current_file = getattr(options, 'current_file', None)  # Get current file context if available
+
+    logger.debug(f"Processing image for embedding: {url}")
+
+    # Strip any dimension suffix after an unescaped pipe
+    url, _ = split_on_unescaped_pipe(url)
+    url = url.strip()
+
+    if is_embedded_image(url):
+        logger.debug("Image already embedded, skipping.")
+        return None
+
+    if options.yarle_mode and not url.startswith(("http://", "https://")):
+        if "./_resources/" in url or ".resources/" in url:
+            logger.debug(f"Handling Yarle resource path: {url}")
+            resolved_path = resolve_file_path(url, options.base_path)
+            if resolved_path:
+                url = resolved_path
+                logger.debug(f"Resolved to: {url}")
+
+    # Resolve local vs remote
+    if not url.startswith(("http://", "https://")):
+        is_local_file = True
+        if not os.path.isfile(url):
+            logger.debug(f"File not found at exact path: {url}")
+            resolved_path = resolve_file_path(url, options.base_path)
+            if resolved_path:
+                url = resolved_path
+                logger.debug(f"Resolved to: {url}")
+            else:
+                logger.debug(f"Failed to resolve local file: {url}")
+                # Try to create directory listing to help diagnose the issue
+                try:
+                    dir_path = os.path.dirname(url) or '.'
+                    if os.path.exists(dir_path):
+                        files = os.listdir(dir_path)
+                        logger.debug(
+                            f"Files in directory {dir_path}: "
+                            f"{files[:10]}{' and more...' if len(files) > 10 else ''}"
+                        )
+                except Exception as dir_err:
+                    logger.debug(f"Error listing directory: {dir_err}")
+                
+                stats["non_embedded_resources"].add(url)
+                return None
+        try:
+            with open(url, "rb") as f:
+                image_data = f.read()
+        except Exception as e:
+            err_msg = f"Error reading local file: {url} - {e}"
+            if current_file:
+                log_error_with_prefix(err_msg, os.path.basename(current_file))
+            else:
+                logger.error(err_msg)
+            stats["non_embedded_resources"].add(url)
+            return None
+    else:
+        image_data = download_image(url)
+        if not image_data:
+            logger.debug(f"Failed to download image: {url}")
+            stats["non_embedded_resources"].add(url)
+            return None
+
+    if is_video_file(image_data):
+        logger.info(f"Skipping video file: {url}")
+        stats["non_embedded_resources"].add(url)
+        return None
+
+    mime_type = get_mime_type(url)
+    if not mime_type:
+        logger.debug(f"Unsupported file type: {url}")
+        stats["non_embedded_resources"].add(url)
+        return None
+
+    compressed_data, jpeg_quality, original_size, compressed_size = compress_to_jpeg(
+        image_data,
+        options.quality_scale,
+        url,
+        options.max_width,
+        options.max_height,
+    )
+    if not compressed_data:
+        logger.debug(f"Image compression failed: {url}")
+        stats["non_embedded_resources"].add(url)
+        return None
+
+    stats["total_image_size"] += original_size
+    stats["total_compressed_size"] += compressed_size
+
+    # Log detailed size info at INFO level (will go to file always, console if -v or -d)
+    logger.info(
+        f"Embedding [{url}](JPEG quality {jpeg_quality}%): "
+        f"{format_file_size(original_size)} -> {format_file_size(compressed_size)}"
+    )
+
+    base64_data = base64.b64encode(compressed_data).decode('ascii')
+    final_size = len(base64_data) + MARKDOWN_IMAGE_OVERHEAD
+    max_file_size_bytes = options.max_file_size_mb * 1024 * 1024
+    if final_size > max_file_size_bytes:
+        logger.debug(
+            f"Base64 encoded image too large: {url} "
+            f"({format_file_size(final_size)}) > {format_file_size(max_file_size_bytes)}"
+        )
+        stats["non_embedded_resources"].add(url)
+        return None
+
+    data_url = f"data:{mime_type};base64,{base64_data}"
+    return data_url
 
 def resolve_file_path(path: str, base_path: str) -> str:
     """
@@ -866,25 +1001,80 @@ def process_markdown(markdown: str, options: CommandLineOptions, current_file_pa
     # This is a key message, log at INFO level for log file and verbose console
     logger.info(f"Found {len(matches)} image links{file_context}") 
 
-    result = []
+    # --- First pass: generate unique embedded data URLs ---
+    key_to_embedded_id: dict[Tuple[str, str], str] = {}
+    embedded_data_by_id: dict[str, str] = {}
+    img_counter = 1
+
+    for match in matches:
+        # Canonical key: reference label when available, otherwise URL
+        if getattr(match, "style", None) == "reference" and match.ref_id:
+            key = ("ref", match.ref_id)
+        else:
+            key = ("url", match.url)
+
+        if key in key_to_embedded_id:
+            # Already processed this logical image
+            continue
+
+        data_url = embed_image_data(match, temp_options, stats)
+        if not data_url:
+            stats["skipped_images"] += 1
+            continue
+
+        embedded_id = f"mie-img-{img_counter}"
+        img_counter += 1
+        key_to_embedded_id[key] = embedded_id
+        embedded_data_by_id[embedded_id] = data_url
+        stats["images_processed"] += 1
+
+    # --- Second pass: rebuild markdown body using reference IDs ---
+    result_parts = []
     last_pos = 0
+
     for match in matches:
         if match.position > last_pos:
-            result.append(markdown[last_pos:match.position])
-        logger.debug(f"Processing image match at position {match.position}")
-        embedded_image = process_image_match(match, temp_options, stats)
-        result.append(embedded_image)
+            result_parts.append(markdown[last_pos:match.position])
+
+        if getattr(match, "style", None) == "reference" and match.ref_id:
+            key = ("ref", match.ref_id)
+        else:
+            key = ("url", match.url)
+
+        embedded_id = key_to_embedded_id.get(key)
+        if not embedded_id:
+            # No embedded data for this image; leave original intact
+            result_parts.append(match.original_text)
+        else:
+            # Preserve any dimensions encoded in the alt text
+            alt_text = match.alt_text or ""
+            alt_main, dimensions = split_on_unescaped_pipe(alt_text)
+            alt_main = alt_main.replace('\\', '')
+            if dimensions:
+                dimensions = dimensions.replace(r'\|', '|')
+            else:
+                dimensions = ""
+
+            display_alt = f"{alt_main}{dimensions}"
+            replacement = f"![{display_alt}][{embedded_id}]"
+            result_parts.append(replacement)
+
         last_pos = match.position + match.length
 
-        if embedded_image != match.original_text:
-            stats["images_processed"] += 1
-        else:
-            stats["skipped_images"] += 1
-
     if last_pos < len(markdown):
-        result.append(markdown[last_pos:])
+        result_parts.append(markdown[last_pos:])
 
-    output = ''.join(result)
+    body = ''.join(result_parts)
+
+    # --- Append embedded image reference definitions at the end ---
+    if embedded_data_by_id:
+        # Ensure there's a blank line before our block
+        body = body.rstrip() + "\n\n"
+        body += "<!-- Embedded image data generated by markdown_image_embedder -->\n"
+        for embedded_id, data_url in embedded_data_by_id.items():
+            body += f"[{embedded_id}]: {data_url}\n"
+
+    output = body
     stats["total_output_size"] = len(output)
 
     total_original_size = original_markdown_size + stats["total_image_size"]
@@ -954,6 +1144,7 @@ def main() -> int:
 
     # --- Processing Loop ---
     if files_to_process:
+        is_first_output_write = bool(options.output_file)
         # Print header with clear description of what we're processing
         file_count = len(files_to_process)
         if file_count == 1:
@@ -986,7 +1177,23 @@ def main() -> int:
                 overall_non_embedded.update(stats["non_embedded_resources"])
 
                 # Determine output action
-                if options.backup:
+                if options.output_file:
+                    # Aggregate all processed files into a single output file.
+                    # First file truncates/creates, subsequent files append.
+                    logger.debug(f"Writing output to file: {options.output_file}") 
+                    try:
+                        mode = 'w' if is_first_output_write else 'a'
+                        with open(options.output_file, mode, encoding='utf-8') as f:
+                            f.write(output_markdown)
+                        is_first_output_write = False
+                        file_detail["status"] = "OK"
+                        processed_files_count += 1
+                    except Exception as e:
+                        err_msg = f"Failed to write output file {options.output_file}: {e}"
+                        log_error_with_prefix(err_msg, os.path.basename(input_file))
+                        file_detail["message"] = f"write failed: {e}"
+                        exit_code = 1
+                elif options.backup:
                     backup_file = input_file + ".bak"
                     # Log backup action at DEBUG level (less critical than processing)
                     logger.debug(f"Creating backup: {backup_file}") 
@@ -1015,20 +1222,6 @@ def main() -> int:
                         err_msg = f"Failed to overwrite {input_file}: {e}"
                         log_error_with_prefix(err_msg, os.path.basename(input_file))
                         file_detail["message"] = f"overwrite failed: {e}"
-                        exit_code = 1
-                elif options.output_file:
-                    # This case should only happen for a single, non-wildcard input per validation
-                    # Log write action at DEBUG level
-                    logger.debug(f"Writing output to file: {options.output_file}") 
-                    try:
-                        with open(options.output_file, 'w', encoding='utf-8') as f:
-                            f.write(output_markdown)
-                        file_detail["status"] = "OK"
-                        processed_files_count += 1
-                    except Exception as e:
-                        err_msg = f"Failed to write output file {options.output_file}: {e}"
-                        log_error_with_prefix(err_msg, os.path.basename(input_file))
-                        file_detail["message"] = f"write failed: {e}"
                         exit_code = 1
                 else:
                     # Single file, no backup/overwrite, no output file -> stdout
